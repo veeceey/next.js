@@ -2,13 +2,21 @@ use std::{any::type_name, sync::Arc};
 
 use anyhow::Result;
 use either::Either;
-use smallvec::SmallVec;
+use turbo_bincode::TurboBincodeBuffer;
 use turbo_tasks::{TaskId, backend::CachedTaskType};
 
-use crate::{
-    backend::{AnyOperation, SpecificTaskDataCategory, storage_schema::TaskStorage},
-    utils::chunked_vec::ChunkedVec,
-};
+use crate::backend::{AnyOperation, SpecificTaskDataCategory, storage_schema::TaskStorage};
+
+/// A single item yielded by the snapshot iterator during persistence.
+pub struct SnapshotItem {
+    pub task_id: TaskId,
+    /// Serialized task meta data, if modified
+    pub meta: Option<TurboBincodeBuffer>,
+    /// Serialized task data, if modified
+    pub data: Option<TurboBincodeBuffer>,
+    /// Task type for new tasks that need to be added to the task cache
+    pub task_type: Option<Arc<CachedTaskType>>,
+}
 
 /// Represents types accepted by [`TurboTasksBackend::new`]. Typically this is the value returned by
 /// [`default_backing_storage`] or [`noop_backing_storage`].
@@ -44,21 +52,9 @@ pub trait BackingStorageSealed: 'static + Send + Sync {
     fn next_free_task_id(&self) -> Result<TaskId>;
     fn uncompleted_operations(&self) -> Result<Vec<AnyOperation>>;
 
-    fn save_snapshot<I>(
-        &self,
-        operations: Vec<Arc<AnyOperation>>,
-        task_cache_updates: Vec<ChunkedVec<(Arc<CachedTaskType>, TaskId)>>,
-        snapshots: Vec<I>,
-    ) -> Result<()>
+    fn save_snapshot<I>(&self, operations: Vec<Arc<AnyOperation>>, snapshots: Vec<I>) -> Result<()>
     where
-        I: Iterator<
-                Item = (
-                    TaskId,
-                    Option<SmallVec<[u8; 16]>>,
-                    Option<SmallVec<[u8; 16]>>,
-                ),
-            > + Send
-            + Sync;
+        I: Iterator<Item = SnapshotItem> + Send + Sync;
     fn start_read_transaction(&self) -> Option<Self::ReadTransaction<'_>>;
     /// # Safety
     ///
@@ -121,25 +117,12 @@ where
         either::for_both!(self, this => this.uncompleted_operations())
     }
 
-    fn save_snapshot<I>(
-        &self,
-        operations: Vec<Arc<AnyOperation>>,
-        task_cache_updates: Vec<ChunkedVec<(Arc<CachedTaskType>, TaskId)>>,
-        snapshots: Vec<I>,
-    ) -> Result<()>
+    fn save_snapshot<I>(&self, operations: Vec<Arc<AnyOperation>>, snapshots: Vec<I>) -> Result<()>
     where
-        I: Iterator<
-                Item = (
-                    TaskId,
-                    Option<SmallVec<[u8; 16]>>,
-                    Option<SmallVec<[u8; 16]>>,
-                ),
-            > + Send
-            + Sync,
+        I: Iterator<Item = SnapshotItem> + Send + Sync,
     {
         either::for_both!(self, this => this.save_snapshot(
             operations,
-            task_cache_updates,
             snapshots,
         ))
     }

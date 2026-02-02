@@ -1643,21 +1643,26 @@ impl AggregationUpdateQueue {
         if result.is_err() {
             retry += 1;
             if retry > MAX_RETRIES {
-                panic!(
-                    "inner_of_uppers_lost_follower is not able to remove follower \
-                     {lost_follower_id} ({}) from {} as they don't exist as upper or follower \
-                     edges",
-                    ctx.task(lost_follower_id, TaskDataCategory::Data)
-                        .get_task_description(),
-                    upper_ids
-                        .iter()
-                        .map(|id| format!(
+                // Collect descriptions eagerly to avoid holding multiple task locks
+                // simultaneously (which would trigger the concurrent lock assertion).
+                let follower_desc = ctx
+                    .task(lost_follower_id, TaskDataCategory::Data)
+                    .get_task_description();
+                let upper_descs = upper_ids
+                    .iter()
+                    .map(|id| {
+                        format!(
                             "{} ({})",
                             id,
                             ctx.task(*id, TaskDataCategory::Data).get_task_description()
-                        ))
-                        .collect::<Vec<_>>()
-                        .join(", ")
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                panic!(
+                    "inner_of_uppers_lost_follower is not able to remove follower \
+                     {lost_follower_id} ({follower_desc}) from {upper_descs} as they don't exist \
+                     as upper or follower edges",
                 );
             }
             self.push(AggregationUpdateJob::InnerOfUppersLostFollower {
@@ -1796,21 +1801,27 @@ impl AggregationUpdateQueue {
         if result.is_err() {
             retry += 1;
             if retry > MAX_RETRIES {
-                panic!(
-                    "inner_of_upper_lost_followers is not able to remove followers {} from \
-                     {upper_id} ({}) as they don't exist as upper or follower edges",
-                    lost_follower_ids
-                        .iter()
-                        .map(|id| format!(
+                // Collect descriptions eagerly to avoid holding multiple task locks
+                // simultaneously (which would trigger the concurrent lock assertion).
+                let follower_descs = lost_follower_ids
+                    .iter()
+                    .map(|id| {
+                        format!(
                             "{} ({})",
                             id,
                             ctx.task(*id, TaskDataCategory::Data).get_task_description()
-                        ))
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    ctx.task(upper_id, TaskDataCategory::Data)
-                        .get_task_description()
-                )
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let upper_desc = ctx
+                    .task(upper_id, TaskDataCategory::Data)
+                    .get_task_description();
+                panic!(
+                    "inner_of_upper_lost_followers is not able to remove followers \
+                     {follower_descs} from {upper_id} ({upper_desc}) as they don't exist as upper \
+                     or follower edges",
+                );
             }
             self.push(AggregationUpdateJob::InnerOfUpperLostFollowers {
                 upper_id,
@@ -2401,7 +2412,7 @@ impl AggregationUpdateQueue {
     /// Only used when activeness is tracked.
     fn increase_active_count(
         &mut self,
-        ctx: &mut impl ExecuteContext,
+        ctx: &mut impl ExecuteContext<'_>,
         task_id: TaskId,
         task_type: Option<Arc<CachedTaskType>>,
     ) {
@@ -2420,7 +2431,7 @@ impl AggregationUpdateQueue {
         if let Some(task_type) = task_type
             && !task.has_persistent_task_type()
         {
-            let _ = task.set_persistent_task_type(task_type);
+            task.init_new_persistent_task(task_type);
         }
         let state = task.get_activeness_mut_or_insert_with(|| ActivenessState::new(task_id));
         let is_new = state.is_empty();

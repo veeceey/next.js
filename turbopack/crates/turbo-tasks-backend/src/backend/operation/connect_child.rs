@@ -85,7 +85,7 @@ impl ConnectChildOperation {
             if let Some(child_task_type) = child_task_type
                 && !child_task.has_persistent_task_type()
             {
-                child_task.set_persistent_task_type(child_task_type.into());
+                child_task.init_new_persistent_task(child_task_type.into());
             }
 
             if !child_task.has_output()

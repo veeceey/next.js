@@ -20,7 +20,7 @@ use turbo_tasks::{
 use crate::{
     GitVersionInfo,
     backend::{AnyOperation, SpecificTaskDataCategory, storage_schema::TaskStorage},
-    backing_storage::{BackingStorage, BackingStorageSealed},
+    backing_storage::{BackingStorage, BackingStorageSealed, SnapshotItem},
     database::{
         db_invalidation::{StartupCacheState, check_db_invalidation_and_cleanup, invalidate_db},
         db_versioning::handle_db_versioning,
@@ -31,7 +31,6 @@ use crate::{
         },
     },
     db_invalidation::invalidation_reasons,
-    utils::chunked_vec::ChunkedVec,
 };
 
 const META_KEY_OPERATIONS: u32 = 0;
@@ -250,29 +249,13 @@ impl<T: KeyValueDatabase + Send + Sync + 'static> BackingStorageSealed
         get(&self.inner.database).context("Unable to read uncompleted operations from database")
     }
 
-    fn save_snapshot<I>(
-        &self,
-        operations: Vec<Arc<AnyOperation>>,
-        task_cache_updates: Vec<ChunkedVec<(Arc<CachedTaskType>, TaskId)>>,
-        snapshots: Vec<I>,
-    ) -> Result<()>
+    fn save_snapshot<I>(&self, operations: Vec<Arc<AnyOperation>>, snapshots: Vec<I>) -> Result<()>
     where
-        I: Iterator<
-                Item = (
-                    TaskId,
-                    Option<TurboBincodeBuffer>,
-                    Option<TurboBincodeBuffer>,
-                ),
-            > + Send
-            + Sync,
+        I: Iterator<Item = SnapshotItem> + Send + Sync,
     {
         let _span = tracing::info_span!("save snapshot", operations = operations.len()).entered();
         let mut batch = self.inner.database.write_batch()?;
 
-        // these buffers should be large, because they're temporary and re-used.
-        // From measuring a large application the largest TaskType was ~365b, so this should be big
-        // enough to trigger no resizes in the loop.
-        const INITIAL_ENCODE_BUFFER_CAPACITY: usize = 512;
         #[cfg(feature = "print_cache_item_size")]
         let all_stats: std::sync::Mutex<
             std::collections::HashMap<&'static str, TaskTypeCacheStats>,
@@ -282,148 +265,103 @@ impl<T: KeyValueDatabase + Send + Sync + 'static> BackingStorageSealed
             &mut WriteBatch::Concurrent(ref batch, _) => {
                 {
                     let _span = tracing::trace_span!("update task data").entered();
-                    process_task_data(snapshots, Some(batch))?;
+                    let max_new_task_id = process_task_data(snapshots, Some(batch))?;
                     let span = tracing::trace_span!("flush task data").entered();
                     parallel::try_for_each(
-                        &[KeySpace::TaskMeta, KeySpace::TaskData],
+                        &[KeySpace::TaskMeta, KeySpace::TaskData, KeySpace::TaskCache],
                         |&key_space| {
                             let _span = span.clone().entered();
-                            // Safety: We already finished all processing of the task data and task
-                            // meta
+                            // Safety: We already finished all processing of the task data, task
+                            // meta, and task cache
                             unsafe { batch.flush(key_space) }
                         },
                     )?;
+
+                    let mut next_task_id =
+                        get_next_free_task_id::<
+                            T::SerialWriteBatch<'_>,
+                            T::ConcurrentWriteBatch<'_>,
+                        >(&mut WriteBatchRef::concurrent(batch))?;
+                    next_task_id = next_task_id.max(max_new_task_id + 1);
+
+                    save_infra::<T::SerialWriteBatch<'_>, T::ConcurrentWriteBatch<'_>>(
+                        &mut WriteBatchRef::concurrent(batch),
+                        next_task_id,
+                        operations,
+                    )?;
                 }
-
-                let mut next_task_id = get_next_free_task_id::<
-                    T::SerialWriteBatch<'_>,
-                    T::ConcurrentWriteBatch<'_>,
-                >(&mut WriteBatchRef::concurrent(batch))?;
-
-                {
-                    let _span = tracing::trace_span!(
-                        "update task cache",
-                        items = task_cache_updates.iter().map(|m| m.len()).sum::<usize>()
-                    )
-                    .entered();
-                    let max_task_id = parallel::map_collect_owned::<_, _, Result<Vec<_>>>(
-                        task_cache_updates,
-                        |updates| {
-                            let _span = _span.clone().entered();
-                            let mut max_task_id = 0;
-
-                            // Re-use the same buffer across every `serialize_task_type` call in
-                            // this chunk. `ConcurrentWriteBatch::put` will copy the data out of
-                            // this buffer into smaller exact-sized vecs.
-                            let mut task_type_bytes =
-                                TurboBincodeBuffer::with_capacity(INITIAL_ENCODE_BUFFER_CAPACITY);
-                            for (task_type, task_id) in updates {
-                                task_type_bytes.clear();
-                                encode_task_type(&task_type, &mut task_type_bytes, Some(task_id))?;
-                                let task_id: u32 = *task_id;
-
-                                batch
-                                    .put(
-                                        KeySpace::TaskCache,
-                                        WriteBuffer::Borrowed(&task_type_bytes),
-                                        WriteBuffer::Borrowed(&task_id.to_le_bytes()),
-                                    )
-                                    .with_context(|| {
-                                        format!(
-                                            "Unable to write task cache {task_type:?} => {task_id}"
-                                        )
-                                    })?;
-                                #[cfg(feature = "print_cache_item_size")]
-                                all_stats
-                                    .lock()
-                                    .unwrap()
-                                    .entry(task_type.get_name())
-                                    .or_default()
-                                    .add(&task_type_bytes);
-                                max_task_id = max_task_id.max(task_id);
-                            }
-
-                            Ok(max_task_id)
-                        },
-                    )?
-                    .into_iter()
-                    .max()
-                    .unwrap_or(0);
-                    next_task_id = next_task_id.max(max_task_id + 1);
-                }
-
-                save_infra::<T::SerialWriteBatch<'_>, T::ConcurrentWriteBatch<'_>>(
-                    &mut WriteBatchRef::concurrent(batch),
-                    next_task_id,
-                    operations,
-                )?;
             }
             WriteBatch::Serial(batch) => {
+                let mut max_new_task_id = 0u32;
                 {
                     let _span = tracing::trace_span!("update tasks").entered();
-                    let task_items =
-                        process_task_data(snapshots, None::<&T::ConcurrentWriteBatch<'_>>)?;
-                    for (task_id, meta, data) in task_items.into_iter().flatten() {
+                    // Re-use the same buffer across every `serialize_task_type` call.
+                    let mut task_type_bytes = TurboBincodeBuffer::with_capacity(512);
+                    for SnapshotItem {
+                        task_id,
+                        meta,
+                        data,
+                        task_type,
+                    } in snapshots.into_iter().flatten()
+                    {
                         let key = IntKey::new(*task_id);
                         let key = key.as_ref();
                         if let Some(meta) = meta {
                             batch
-                                .put(KeySpace::TaskMeta, WriteBuffer::Borrowed(key), meta)
+                                .put(
+                                    KeySpace::TaskMeta,
+                                    WriteBuffer::Borrowed(key),
+                                    WriteBuffer::SmallVec(meta),
+                                )
                                 .with_context(|| {
                                     format!("Unable to write meta items for {task_id}")
                                 })?;
                         }
                         if let Some(data) = data {
                             batch
-                                .put(KeySpace::TaskData, WriteBuffer::Borrowed(key), data)
+                                .put(
+                                    KeySpace::TaskData,
+                                    WriteBuffer::Borrowed(key),
+                                    WriteBuffer::SmallVec(data),
+                                )
                                 .with_context(|| {
                                     format!("Unable to write data items for {task_id}")
                                 })?;
                         }
+                        // Write task cache entry if this is a new task
+                        if let Some(task_type) = task_type {
+                            task_type_bytes.clear();
+                            encode_task_type(&task_type, &mut task_type_bytes, Some(task_id))?;
+                            let task_id_val: u32 = *task_id;
+                            batch
+                                .put(
+                                    KeySpace::TaskCache,
+                                    WriteBuffer::Borrowed(&task_type_bytes),
+                                    WriteBuffer::Borrowed(&task_id_val.to_le_bytes()),
+                                )
+                                .with_context(|| {
+                                    format!("Unable to write task cache {task_type:?} => {task_id}")
+                                })?;
+                            #[cfg(feature = "print_cache_item_size")]
+                            all_stats
+                                .lock()
+                                .unwrap()
+                                .entry(task_type.get_name())
+                                .or_default()
+                                .add(&task_type_bytes);
+                            max_new_task_id = max_new_task_id.max(task_id_val);
+                        }
                     }
                     batch.flush(KeySpace::TaskMeta)?;
                     batch.flush(KeySpace::TaskData)?;
+                    batch.flush(KeySpace::TaskCache)?;
                 }
 
                 let mut next_task_id = get_next_free_task_id::<
                     T::SerialWriteBatch<'_>,
                     T::ConcurrentWriteBatch<'_>,
                 >(&mut WriteBatchRef::serial(batch))?;
-
-                {
-                    let _span = tracing::trace_span!(
-                        "update task cache",
-                        items = task_cache_updates.iter().map(|m| m.len()).sum::<usize>()
-                    )
-                    .entered();
-                    // Re-use the same buffer across every `serialize_task_type` call.
-                    // `ConcurrentWriteBatch::put` will copy the data out of this buffer into
-                    // smaller exact-sized vecs.
-                    let mut task_type_bytes =
-                        TurboBincodeBuffer::with_capacity(INITIAL_ENCODE_BUFFER_CAPACITY);
-                    for (task_type, task_id) in task_cache_updates.into_iter().flatten() {
-                        encode_task_type(&task_type, &mut task_type_bytes, Some(task_id))?;
-                        let task_id = *task_id;
-
-                        batch
-                            .put(
-                                KeySpace::TaskCache,
-                                WriteBuffer::Borrowed(&task_type_bytes),
-                                WriteBuffer::Borrowed(&task_id.to_le_bytes()),
-                            )
-                            .with_context(|| {
-                                format!("Unable to write task cache {task_type:?} => {task_id}")
-                            })?;
-                        #[cfg(feature = "print_cache_item_size")]
-                        all_stats
-                            .lock()
-                            .unwrap()
-                            .entry(task_type.get_name())
-                            .or_default()
-                            .add(&task_type_bytes);
-                        next_task_id = next_task_id.max(task_id + 1);
-                    }
-                }
+                next_task_id = next_task_id.max(max_new_task_id + 1);
 
                 save_infra::<T::SerialWriteBatch<'_>, T::ConcurrentWriteBatch<'_>>(
                     &mut WriteBatchRef::serial(batch),
@@ -672,14 +610,6 @@ fn encode_task_type(
     Ok(())
 }
 
-type SerializedTasks = Vec<
-    Vec<(
-        TaskId,
-        Option<WriteBuffer<'static>>,
-        Option<WriteBuffer<'static>>,
-    )>,
->;
-
 #[cfg(feature = "print_cache_item_size")]
 #[derive(Default)]
 struct TaskTypeCacheStats {
@@ -741,23 +671,29 @@ fn print_task_type_cache_stats(stats: std::collections::HashMap<&'static str, Ta
         );
     }
 }
+
+/// Returns the max task_id of new tasks (for updating next_task_id).
 fn process_task_data<'a, B: ConcurrentWriteBatch<'a> + Send + Sync, I>(
     tasks: Vec<I>,
     batch: Option<&B>,
-) -> Result<SerializedTasks>
+) -> Result<u32>
 where
-    I: Iterator<
-            Item = (
-                TaskId,
-                Option<TurboBincodeBuffer>,
-                Option<TurboBincodeBuffer>,
-            ),
-        > + Send
-        + Sync,
+    I: Iterator<Item = SnapshotItem> + Send + Sync,
 {
-    parallel::map_collect_owned::<_, _, Result<Vec<_>>>(tasks, |tasks| {
-        let mut result = Vec::new();
-        for (task_id, meta, data) in tasks {
+    let results = parallel::map_collect_owned::<_, _, Result<Vec<_>>>(tasks, |tasks| {
+        let mut max_new_task_id = 0u32;
+        // these buffers should be large, because they're temporary and re-used.
+        // From measuring a large application the largest TaskType was ~365b, so this should be big
+        // enough to trigger no resizes in the loop.
+        const INITIAL_ENCODE_BUFFER_CAPACITY: usize = 512;
+        let mut task_type_bytes = TurboBincodeBuffer::with_capacity(INITIAL_ENCODE_BUFFER_CAPACITY);
+        for SnapshotItem {
+            task_id,
+            meta,
+            data,
+            task_type,
+        } in tasks
+        {
             if let Some(batch) = batch {
                 let key = IntKey::new(*task_id);
                 let key = key.as_ref();
@@ -775,16 +711,23 @@ where
                         WriteBuffer::SmallVec(data),
                     )?;
                 }
-            } else {
-                // Store the new task data
-                result.push((
-                    task_id,
-                    meta.map(WriteBuffer::SmallVec),
-                    data.map(WriteBuffer::SmallVec),
-                ));
+                // Write task cache entry inline if this is a new task
+                if let Some(task_type) = task_type {
+                    task_type_bytes.clear();
+                    encode_task_type(&task_type, &mut task_type_bytes, Some(task_id))?;
+                    let task_id_val: u32 = *task_id;
+                    batch.put(
+                        KeySpace::TaskCache,
+                        WriteBuffer::Borrowed(&task_type_bytes),
+                        WriteBuffer::Borrowed(&task_id_val.to_le_bytes()),
+                    )?;
+                    max_new_task_id = max_new_task_id.max(task_id_val);
+                }
             }
         }
 
-        Ok(result)
-    })
+        Ok(max_new_task_id)
+    })?;
+
+    Ok(results.into_iter().max().unwrap_or(0))
 }

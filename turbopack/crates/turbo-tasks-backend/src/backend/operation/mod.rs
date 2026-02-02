@@ -745,6 +745,20 @@ pub trait TaskGuard: Debug + TaskStorageAccessors {
         new_value
     }
 
+    /// Initialize a new persistent task with the given task type.
+    ///
+    /// This sets the persistent task type, marks it as new, sets restored flags,
+    /// and tracks modifications for both data and meta categories.
+    fn init_new_persistent_task(&mut self, task_type: Arc<CachedTaskType>) {
+        let flags = &mut self.typed_mut().flags;
+        // mark as `new` so it gets written to the task cache
+        flags.set_new_persistent_task(true);
+        // mark as restored so we don't do db queries for it
+        flags.set_restored(TaskDataCategory::All);
+        // set the key so we can write it to the task cache
+        self.set_persistent_task_type(task_type);
+    }
+
     fn invalidate_serialization(&mut self);
     /// Determine which tasks to prefetch for a task.
     /// Only returns Some once per task.
